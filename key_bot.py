@@ -85,8 +85,9 @@ _MAX_LOG_BYTES = int(os.getenv("LOG_MAX_BYTES", str(2 * 1024 * 1024)))   # ロ�
 _LOG_BACKUPS = int(os.getenv("LOG_BACKUP_COUNT", "5"))                   # ログを何世代保持するか
 
 # --- リマインドや履歴の設定値 ---
-_DEFAULT_DAILY_HOUR = 20   # 毎日リマインドのデフォルト時刻（20 時）
-_DEFAULT_IDLE_HOURS = 2    # 無変化リマインドのデフォルト時間（2 時間）
+_DEFAULT_DAILY_HOUR = 21          # 毎日（返却催促）リマインドのデフォルト時刻（21 時以降）
+_DAILY_CLOSED_GRACE_MINUTES = 30  # daily は未返却（閉めた/持ち出し中）でこの分数経過しないと送らない
+_DEFAULT_IDLE_HOURS = 2           # 場所未報告リマインドのデフォルト時間（2 時間）
 _HISTORY_MAX = 20          # 操作履歴を何件まで保持するか
 _UNDO_TTL_SEC = 60         # 取り消しボタンの有効秒数（このあとボタンが消える）
 
@@ -167,8 +168,8 @@ _STATE_LOCK = asyncio.Lock()
 def _default_reminder() -> dict:
     """リマインド設定の初期値（持ち主が変わるたびにこの値に戻る）"""
     return {
-        "daily_hour": _DEFAULT_DAILY_HOUR,            # 毎日の通知時刻（0 で停止）
-        "idle_hours": _DEFAULT_IDLE_HOURS,            # 無変化通知の時間（0 で停止）
+        "daily_hour": _DEFAULT_DAILY_HOUR,            # 毎日（返却催促）の通知時刻（0 で停止）
+        "idle_hours": _DEFAULT_IDLE_HOURS,            # 場所未報告通知の時間（0 で停止）
         "daily_last_sent_date": None,                 # 最後に daily 通知した日付（重複防止用）
         "idle_last_sent_at": None,                    # 最後に idle 通知した時刻（重複防止用）
     }
@@ -958,11 +959,18 @@ async def _reminder_tick():
         new_daily_sent: str | None = None
         new_idle_sent: str | None = None
 
-        # daily: 長期貸出の最終日より前は抑制（最終日と過ぎた日は出す）
+        # daily（返却催促）: 設定時刻「以降」かつ「未返却のまま一定時間」経過で 1 日 1 回
+        # 未返却 = 閉めた(closed) または 持ち出し中(out)。（長期貸出の最終日より前は抑制）
         daily_hour = rem.get("daily_hour") or 0
-        if daily_hour and now.hour == daily_hour and not _is_before_long_rent_last_day(state):
+        if daily_hour and now.hour >= daily_hour and not _is_before_long_rent_last_day(state):
+            last_change = _parse_iso(state.get("last_change_at"))
+            unreturned_long_enough = (
+                state.get("state") in ("closed", "out")
+                and last_change is not None
+                and (now - last_change).total_seconds() >= _DAILY_CLOSED_GRACE_MINUTES * 60
+            )
             today = now.date().isoformat()
-            if rem.get("daily_last_sent_date") != today:
+            if unreturned_long_enough and rem.get("daily_last_sent_date") != today:
                 try:
                     await channel.send(
                         f"<@{holder_id}> 鍵を返し忘れていませんか？",
@@ -972,9 +980,14 @@ async def _reminder_tick():
                 except discord.HTTPException as e:
                     logger.warning("daily reminder send failed: %s", e)
 
-        # idle: 長期貸出期間（最終日含む）は抑制
+        # idle: 鍵を閉めて場所未報告のときだけ通知（長期貸出期間中は抑制）
+        # state="closed" かつ持ち主あり = 閉めたが「持ち出す」で場所報告していない
         idle_hours = rem.get("idle_hours") or 0
-        if idle_hours and not _is_long_rent_active(state):
+        if (
+            idle_hours
+            and state.get("state") == "closed"
+            and not _is_long_rent_active(state)
+        ):
             last_change = _parse_iso(state.get("last_change_at"))
             last_sent = _parse_iso(rem.get("idle_last_sent_at"))
             candidates = [t for t in (last_change, last_sent) if t]
@@ -982,7 +995,7 @@ async def _reminder_tick():
             if base and (now - base).total_seconds() >= idle_hours * 3600:
                 try:
                     await channel.send(
-                        f"<@{holder_id}> {idle_hours}時間 状態に変化がありません。",
+                        f"<@{holder_id}> 鍵を閉めてから{idle_hours}時間経過しています。場所の報告を忘れていませんか？",
                         allowed_mentions=discord.AllowedMentions(users=True),
                     )
                     new_idle_sent = _now_iso()
@@ -1116,54 +1129,80 @@ async def _announce_reminder_change(
 
 @tree.command(
     name="reminder_daily",
-    description="持ち主のみ。毎日リマインドの時刻を変更",
+    description="持ち主のみ。返却催促リマインドの時刻を変更（未返却のまま30分経過後に送信）",
 )
-@app_commands.describe(hour="毎日リマインドする時刻 (0-23、0 で停止)")
-async def reminder_daily(inter: discord.Interaction, hour: int):
+@app_commands.describe(hour="この時刻以降に返却催促する")
+@app_commands.choices(hour=[
+    app_commands.Choice(name="停止", value=0),
+    app_commands.Choice(name="7時", value=7),
+    app_commands.Choice(name="8時", value=8),
+    app_commands.Choice(name="9時", value=9),
+    app_commands.Choice(name="12時", value=12),
+    app_commands.Choice(name="17時", value=17),
+    app_commands.Choice(name="18時", value=18),
+    app_commands.Choice(name="19時", value=19),
+    app_commands.Choice(name="20時", value=20),
+    app_commands.Choice(name="21時 (デフォルト)", value=21),
+    app_commands.Choice(name="22時", value=22),
+    app_commands.Choice(name="23時", value=23),
+])
+async def reminder_daily(inter: discord.Interaction, hour: app_commands.Choice[int]):
     state = _load_state()
     if state.get("holder_id") != inter.user.id:
         await inter.response.send_message(
             "現在の鍵の持ち主のみ変更できます。", ephemeral=True,
         )
         return
-    if not (0 <= hour <= 23):
-        await inter.response.send_message("hour は 0-23 で指定してください。", ephemeral=True)
-        return
+    hour_val = hour.value
     async with _STATE_LOCK:
         s = _load_state()
-        s["reminder"]["daily_hour"] = hour
+        s["reminder"]["daily_hour"] = hour_val
         s["reminder"]["daily_last_sent_date"] = None
         _save_state_sync(s)
-    desc = "毎日リマインドを停止しました" if hour == 0 else f"毎日リマインドを {hour} 時に変更しました"
+    desc = "返却催促リマインドを停止しました" if hour_val == 0 else f"返却催促リマインドを {hour_val} 時以降（未返却のまま30分経過後）に変更しました"
     await _announce_reminder_change(inter, "リマインド設定変更", desc)
     await inter.response.send_message("変更を反映しました。", ephemeral=True)
-    logger.info("reminder_daily user=%s hour=%d", inter.user, hour)
+    logger.info("reminder_daily user=%s hour=%d", inter.user, hour_val)
 
 
 @tree.command(
     name="reminder_idle",
-    description="持ち主のみ。無変化リマインドの時間を変更",
+    description="持ち主のみ。鍵を閉めて場所未報告のときのリマインド時間を変更",
 )
-@app_commands.describe(hours="無変化リマインドする時間 (0-168、0 で停止)")
-async def reminder_idle(inter: discord.Interaction, hours: int):
+@app_commands.describe(hours="閉めてからリマインドまでの時間")
+@app_commands.choices(hours=[
+    app_commands.Choice(name="停止", value=0),
+    app_commands.Choice(name="1時間", value=1),
+    app_commands.Choice(name="2時間 (デフォルト)", value=2),
+    app_commands.Choice(name="3時間", value=3),
+    app_commands.Choice(name="4時間", value=4),
+    app_commands.Choice(name="6時間", value=6),
+    app_commands.Choice(name="8時間", value=8),
+    app_commands.Choice(name="12時間", value=12),
+    app_commands.Choice(name="24時間", value=24),
+    app_commands.Choice(name="48時間", value=48),
+])
+async def reminder_idle(inter: discord.Interaction, hours: app_commands.Choice[int]):
     state = _load_state()
     if state.get("holder_id") != inter.user.id:
         await inter.response.send_message(
             "現在の鍵の持ち主のみ変更できます。", ephemeral=True,
         )
         return
-    if not (0 <= hours <= 168):
-        await inter.response.send_message("hours は 0-168 で指定してください。", ephemeral=True)
-        return
+    hours_val = hours.value
     async with _STATE_LOCK:
         s = _load_state()
-        s["reminder"]["idle_hours"] = hours
+        s["reminder"]["idle_hours"] = hours_val
         s["reminder"]["idle_last_sent_at"] = None
         _save_state_sync(s)
-    desc = "無変化リマインドを停止しました" if hours == 0 else f"無変化リマインドを {hours} 時間に変更しました"
+    desc = (
+        "場所未報告リマインドを停止しました"
+        if hours_val == 0
+        else f"鍵を閉めて場所未報告のときのリマインドを {hours_val} 時間に変更しました"
+    )
     await _announce_reminder_change(inter, "リマインド設定変更", desc)
     await inter.response.send_message("変更を反映しました。", ephemeral=True)
-    logger.info("reminder_idle user=%s hours=%d", inter.user, hours)
+    logger.info("reminder_idle user=%s hours=%d", inter.user, hours_val)
 
 
 @tree.command(
@@ -1201,19 +1240,19 @@ async def reminder_status(inter: discord.Interaction):
 
     # リマインド設定
     daily_hour = rem.get("daily_hour") or 0
-    daily_text = "停止中" if daily_hour == 0 else f"毎日 {daily_hour} 時"
-    embed.add_field(name="毎日リマインド (daily)", value=daily_text, inline=True)
+    daily_text = "停止中" if daily_hour == 0 else f"{daily_hour} 時以降・未返却{_DAILY_CLOSED_GRACE_MINUTES}分後"
+    embed.add_field(name="返却催促リマインド (daily)", value=daily_text, inline=True)
 
     idle_hours = rem.get("idle_hours") or 0
-    idle_text = "停止中" if idle_hours == 0 else f"{idle_hours} 時間 無変化で通知"
-    embed.add_field(name="無変化リマインド (idle)", value=idle_text, inline=True)
+    idle_text = "停止中" if idle_hours == 0 else f"閉めて場所未報告で {idle_hours} 時間"
+    embed.add_field(name="場所未報告リマインド (idle)", value=idle_text, inline=True)
 
     # 長期貸出の状況とリマインドへの影響
     ld = state.get("long_rent_until")
     if ld:
         lines = [f"最終日: **{ld}**"]
         if _is_before_long_rent_last_day(state):
-            lines.append("→ daily: 最終日まで停止（最終日 20 時に通知予定）")
+            lines.append(f"→ daily: 最終日まで停止（最終日 {daily_hour} 時以降に通知予定）")
             lines.append("→ idle: 期間中ずっと停止")
         elif _is_long_rent_active(state):
             lines.append("→ daily: 本日（最終日）通知あり")
@@ -1226,14 +1265,24 @@ async def reminder_status(inter: discord.Interaction):
     if holder_id:
         if daily_hour and not _is_before_long_rent_last_day(state):
             today_iso = now.date().isoformat()
-            if rem.get("daily_last_sent_date") != today_iso and now.hour < daily_hour:
-                next_daily = f"今日 {daily_hour} 時"
-            else:
+            if rem.get("daily_last_sent_date") == today_iso:
                 tomorrow = now.date() + timedelta(days=1)
-                next_daily = f"{tomorrow.isoformat()} {daily_hour} 時"
+                next_daily = f"{tomorrow.isoformat()} {daily_hour} 時以降"
+            elif state.get("state") in ("closed", "out"):
+                last_change_dt = _parse_iso(state.get("last_change_at"))
+                grace = (last_change_dt or now) + timedelta(minutes=_DAILY_CLOSED_GRACE_MINUTES)
+                hour_anchor = now.replace(hour=daily_hour, minute=0, second=0, microsecond=0)
+                eta = max(grace.astimezone(get_localzone()), hour_anchor)
+                next_daily = "まもなく" if eta <= now else f"今日 {eta.strftime('%H:%M')} 頃"
+            else:
+                next_daily = f"今日 {daily_hour} 時以降（未返却30分後）"
             embed.add_field(name="次回 daily 予定", value=next_daily, inline=True)
 
-        if idle_hours and not _is_long_rent_active(state):
+        if (
+            idle_hours
+            and state.get("state") == "closed"
+            and not _is_long_rent_active(state)
+        ):
             last_change_dt = _parse_iso(state.get("last_change_at"))
             last_sent_dt = _parse_iso(rem.get("idle_last_sent_at"))
             candidates = [t for t in (last_change_dt, last_sent_dt) if t]
@@ -1321,7 +1370,7 @@ async def debug_reminder(inter: discord.Interaction, type: app_commands.Choice[s
     else:
         idle_hours = (state.get("reminder") or {}).get("idle_hours", _DEFAULT_IDLE_HOURS)
         await channel.send(
-            f"[テスト] <@{holder_id}> {idle_hours}時間 状態に変化がありません。",
+            f"[テスト] <@{holder_id}> 鍵を閉めてから{idle_hours}時間経過しています。場所の報告を忘れていませんか？",
             allowed_mentions=discord.AllowedMentions(users=True),
         )
     await inter.response.send_message("[debug] テスト通知を送信しました。", ephemeral=True)
