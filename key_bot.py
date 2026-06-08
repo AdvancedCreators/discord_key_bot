@@ -1112,19 +1112,14 @@ async def on_ready():
     # 起動メッセージの再利用 or 新規作成
     state = _load_state()
     view_key = _view_key_for_state(state)
-    embed = discord.Embed(
-        title="on ready",
-        color=0x0000FF,
-        description="操作を選択してください",
-    )
-    _decorate_embed_with_status(embed, state)
     view = _build_view(view_key, include_undo=False)
 
     reused = False
     if state.get("last_message_id"):
         try:
             prev = await channel.fetch_message(state["last_message_id"])
-            await prev.edit(embed=embed, view=view)
+            # 既存メッセージは embed（動作主・タイトル）をそのまま残し、ボタンだけ更新する
+            await prev.edit(view=view)
             reused = True
         except discord.NotFound:
             pass
@@ -1132,6 +1127,9 @@ async def on_ready():
             logger.warning("on_ready: failed to edit last message: %s", e)
 
     if not reused:
+        # 前のメッセージがない場合だけ新規送信。アクター表示は出さない
+        embed = create_Embed("操作を選択してください")
+        _decorate_embed_with_status(embed, state)
         try:
             sent = await channel.send(embed=embed, view=view)
             async with _STATE_LOCK:
