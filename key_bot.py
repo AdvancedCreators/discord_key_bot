@@ -188,6 +188,7 @@ def _default_state() -> dict:
         "out_location": None,
         "long_rent_until": None,
         "debug_friday": False,
+        "friday_buttons_shown": False,        # 初期画面に土日貸出ボタンを出しているか（金曜境界での貼り替え判定用）
         "reminder": _default_reminder(),
         "history": [],
     }
@@ -771,6 +772,8 @@ async def _send_action_message(
 
         state["last_message_id"] = new_msg_id
         state["last_message_channel_id"] = channel.id
+        if view_key == "initial":
+            state["friday_buttons_shown"] = _is_friday()
         _push_history(state, action, user, new_msg_id, channel.id, prev)
         _save_state_sync(state)
 
@@ -922,9 +925,51 @@ async def _handle_undo(inter: discord.Interaction) -> None:
             except discord.HTTPException as e:
                 logger.warning("undo: initial send failed: %s", e)
 
+        if view_key == "initial":
+            state["friday_buttons_shown"] = _is_friday()
         _save_state_sync(state)
 
     logger.info("undo user=%s action=%s", user, last.get("action"))
+
+
+# --- 金曜の土日貸出ボタンの貼り替え ---
+
+async def _refresh_friday_buttons() -> None:
+    """金曜の境界で、返却済み（初期画面）の最新メッセージのボタンを貼り替える。
+
+    木曜に返却して翌金曜になった場合など、誰も操作しなくても土日貸出ボタンが
+    出るように、表示中の状態と曜日がズレていたら最新メッセージを編集する。
+    （土日に入って金曜でなくなったら逆にボタンを外す）
+    """
+    state = _load_state()
+    # 持ち主なし = 初期画面。土日貸出ボタンの有無が変わるのはこの局面だけ。
+    if state.get("holder_id") is not None:
+        return
+
+    friday_now = _is_friday()
+    if bool(state.get("friday_buttons_shown")) == friday_now:
+        return  # 表示と曜日が一致しているので何もしない
+
+    msg_id = state.get("last_message_id")
+    channel_id = state.get("last_message_channel_id") or _KEY_CHANNEL_ID
+    channel = client.get_channel(channel_id)
+    if channel is None or not msg_id:
+        return
+
+    try:
+        msg = await channel.fetch_message(msg_id)
+        await msg.edit(view=_build_view("initial", include_undo=False))
+    except discord.NotFound:
+        return
+    except discord.HTTPException as e:
+        logger.warning("refresh friday buttons: edit failed: %s", e)
+        return
+
+    async with _STATE_LOCK:
+        s = _load_state()
+        s["friday_buttons_shown"] = friday_now
+        _save_state_sync(s)
+    logger.info("friday buttons refreshed: friday=%s", friday_now)
 
 
 # --- リマインド（自動通知） ---
@@ -944,6 +989,9 @@ async def _reminder_tick():
                 s2 = _load_state()
                 s2["long_rent_until"] = None
                 _save_state_sync(s2)
+
+        # 金曜の境界で初期画面（返却済み）の土日貸出ボタンを貼り替える
+        await _refresh_friday_buttons()
 
         if not holder_id:
             return
@@ -1093,6 +1141,13 @@ async def on_ready():
                 _save_state_sync(s)
         except discord.HTTPException as e:
             logger.warning("on_ready: send failed: %s", e)
+
+    # 初期画面を出した場合、土日ボタンの表示状態を記録（金曜境界での貼り替え判定用）
+    if view_key == "initial":
+        async with _STATE_LOCK:
+            s = _load_state()
+            s["friday_buttons_shown"] = _is_friday()
+            _save_state_sync(s)
 
 
 
