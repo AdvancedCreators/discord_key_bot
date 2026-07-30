@@ -435,6 +435,11 @@ async def _handle_nfc(request: web.Request) -> web.Response:
         return web.Response(status=503, text="channel not found")
 
     user = client.get_user(int(user_id_str))
+    if user is None:
+        try:
+            user = await client.fetch_user(int(user_id_str))
+        except discord.NotFound:
+            pass
 
     async with _STATE_LOCK:
         state = _load_state()
@@ -461,8 +466,11 @@ async def _handle_nfc(request: web.Request) -> web.Response:
         else:
             embed.set_author(name=f"ユーザーID: {user_id_str}")
 
+        view_key = _view_key_for_state(state)
+        view = _build_view(view_key, include_undo=False)
+
         try:
-            sent = await channel.send(embed=embed)
+            sent = await channel.send(embed=embed, view=view)
             new_msg_id = sent.id
         except discord.HTTPException as e:
             logger.warning("NFC: failed to send message: %s", e)
