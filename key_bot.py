@@ -8,7 +8,7 @@
   - 部屋を開ける/閉める
   - 鍵を返す
   - 鍵を他の人に受け渡す
-  - 部室を閉めて持ち出す（場所を入力）
+  - 部室を閉めて持ち出す（よく使う場所から選択、または自由入力）
   - 直前の操作を取り消す
   - 金曜は土曜/日曜まで借りる
 - 持ち主にリマインド（定時 + 無変化時間）
@@ -186,6 +186,7 @@ def _default_state() -> dict:
         "last_message_id": None,
         "last_message_channel_id": _KEY_CHANNEL_ID,
         "out_location": None,
+        "out_location_stats": {},              # 持ち出し先ごとの使用回数（選択肢のランキング用）
         "long_rent_until": None,
         "debug_friday": False,
         "friday_buttons_shown": False,        # 初期画面に土日貸出ボタンを出しているか（金曜境界での貼り替え判定用）
@@ -412,6 +413,67 @@ class KeyOutModal(discord.ui.Modal, title="持ち出し先を入力"):
                 await inter.response.send_message("入力エラーが発生しました。", ephemeral=True)
             except discord.HTTPException:
                 pass
+
+
+# --- 持ち出し先の選択メニュー ---
+# 「持ち出す」ボタンを押すと、よく使う持ち出し先があればまず選択式のメニューを出す。
+# 一覧に無い場所は「その他（自由入力）」から従来通り Modal で入力できる。
+
+_OUT_LOCATION_CHOICES = 10       # 選択肢に出す「よく使う持ち出し先」の最大件数
+_CUSTOM_LOCATION_VALUE = "custom"  # 「その他（自由入力）」を表す選択値
+
+
+class OutLocationSelect(discord.ui.Select):
+    def __init__(self, locations: list[str]):
+        self._locations = locations
+        options = [
+            discord.SelectOption(label=loc, value=str(i))
+            for i, loc in enumerate(locations)
+        ]
+        options.append(discord.SelectOption(
+            label="その他（自由入力）", value=_CUSTOM_LOCATION_VALUE, emoji="✏️",
+        ))
+        super().__init__(
+            placeholder="持ち出し先を選択してください",
+            options=options,
+            min_values=1,
+            max_values=1,
+        )
+
+    async def callback(self, inter: discord.Interaction) -> None:
+        value = self.values[0]
+        if value == _CUSTOM_LOCATION_VALUE:
+            try:
+                await inter.response.send_modal(KeyOutModal())
+            except discord.HTTPException as e:
+                logger.warning("send_modal (from select) failed: %s", e)
+            return
+
+        location = self._locations[int(value)]
+        await _handle_room_out_submitted(inter, location)
+        try:
+            await inter.edit_original_response(content=f"「{location}」で持ち出しました。", view=None)
+        except discord.HTTPException:
+            pass
+
+
+class OutLocationView(discord.ui.View):
+    def __init__(self, locations: list[str]):
+        super().__init__(timeout=180)
+        self.add_item(OutLocationSelect(locations))
+
+
+def _record_out_location(state: dict, location: str) -> None:
+    """持ち出し先の使用回数を記録する（選択肢のランキング用）"""
+    stats = state.setdefault("out_location_stats", {})
+    stats[location] = stats.get(location, 0) + 1
+
+
+def _top_out_locations(state: dict, limit: int = _OUT_LOCATION_CHOICES) -> list[str]:
+    """よく使われている持ち出し先を、使用回数が多い順に返す"""
+    stats: dict = state.get("out_location_stats") or {}
+    ranked = sorted(stats.items(), key=lambda kv: kv[1], reverse=True)
+    return [loc for loc, _count in ranked[:limit]]
 
 
 # --- NFC HTTP サーバー ---
@@ -809,6 +871,7 @@ async def _handle_room_out_submitted(inter: discord.Interaction, location: str) 
 
         state["state"] = "out"
         state["out_location"] = location
+        _record_out_location(state, location)
         _set_holder(state, user)
         state["last_change_at"] = _now_iso()
 
@@ -1473,7 +1536,19 @@ async def on_button_click(inter: discord.Interaction):
         return
 
     if custom_id == "room_out_open_modal":
-        # Modal を表示して場所を入力してもらう
+        # よく使う持ち出し先があれば選択メニューを、無ければ直接 Modal を表示する
+        state = _load_state()
+        frequent = _top_out_locations(state)
+        if frequent:
+            try:
+                await inter.response.send_message(
+                    "持ち出し先を選択してください（無ければ「その他」から入力できます）",
+                    view=OutLocationView(frequent),
+                    ephemeral=True,
+                )
+            except discord.HTTPException as e:
+                logger.warning("send location select failed: %s", e)
+            return
         try:
             await inter.response.send_modal(KeyOutModal())
         except discord.HTTPException as e:
