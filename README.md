@@ -14,7 +14,7 @@
 - 📦 **持ち出し場所の共有** — 部室外に鍵を持ち出すとき、Modal で場所を入力
 - ↩️ **操作の取り消し** — 直前の操作を本人限定で 1 分以内に取り消せる
 - 🔕 **最新操作のみアクティブ** — 古いメッセージのボタンは自動で無効化
-- 📅 **金曜の長期貸出** — 「土曜まで借りる」「日曜まで借りる」が金曜のみ表示
+- 📅 **長期貸出** — 曜日を問わず「明日/明後日/3 日後まで」から選んで借りられる
 - ⏰ **自動リマインド** — 未返却なら 21 時以降に返却催促 + 場所未報告 2 時間で持ち主にメンション
 - 📱 **NFC 連携** — iPhone Shortcuts などからの HTTP リクエストで鍵をトグル
 - 📊 **状態確認コマンド** — `/reminder_status` で現状とリマインド予定を一覧表示
@@ -155,7 +155,6 @@ sudo systemctl status discord-key-bot
 
 | コマンド | 説明 |
 |---------|------|
-| `/debug_friday on:<bool>` | 金曜モードを ON/OFF（土日貸出ボタンの表示テスト） |
 | `/debug_reminder type:<daily/idle>` | リマインドを即時送信（state は変更しない） |
 
 ---
@@ -169,7 +168,7 @@ sudo systemctl status discord-key-bot
 
 ### 長期貸出中のリマインド挙動
 
-「土曜まで借りる」「日曜まで借りる」を押した場合:
+**長期貸出** で「いつまで」を選んだ場合:
 
 | 日 | daily | idle |
 |----|-------|------|
@@ -235,7 +234,6 @@ discord_key_bot/
   "last_message_id": 9999,
   "out_location": "場所" | null,
   "long_rent_until": "YYYY-MM-DD" | null,
-  "debug_friday": false,
   "reminder": {
     "daily_hour": 21,
     "idle_hours": 2,

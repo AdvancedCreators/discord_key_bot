@@ -10,7 +10,7 @@
   - 鍵を他の人に受け渡す
   - 部室を閉めて持ち出す（よく使う場所から選択、または自由入力）
   - 直前の操作を取り消す
-  - 金曜は土曜/日曜まで借りる
+  - 長期貸出（明日/明後日/3日後まで、曜日を問わず選択可能）
 - 持ち主にリマインド（定時 + 無変化時間）
 - 各操作は監査ログとして記録され、誰がいつ操作したかが分かる
 - Embedを使用して見やすい表示を実現
@@ -188,8 +188,6 @@ def _default_state() -> dict:
         "out_location": None,
         "out_location_stats": {},              # 持ち出し先ごとの使用回数（選択肢のランキング用）
         "long_rent_until": None,
-        "debug_friday": False,
-        "friday_buttons_shown": False,        # 初期画面に土日貸出ボタンを出しているか（金曜境界での貼り替え判定用）
         "reminder": _default_reminder(),
         "history": [],
     }
@@ -355,12 +353,12 @@ def _set_holder(state: dict, user: discord.abc.User | None) -> bool:
     return True
 
 
-def _is_friday() -> bool:
-    """今日が金曜日かどうか。デバッグモードが ON なら強制的に True"""
-    if _load_state().get("debug_friday"):
-        return True
-    # weekday() は月=0, 火=1, ..., 金=4, 土=5, 日=6
-    return datetime.now(get_localzone()).weekday() == 4
+_WEEKDAY_JP = ("月", "火", "水", "木", "金", "土", "日")
+
+
+def _format_month_day_weekday(d: date) -> str:
+    """date を「9/5(金)」のような表示用文字列にする"""
+    return f"{d.month}/{d.day}({_WEEKDAY_JP[d.weekday()]})"
 
 
 def _is_long_rent_active(state: dict) -> bool:
@@ -383,13 +381,6 @@ def _is_before_long_rent_last_day(state: dict) -> bool:
         return date.fromisoformat(ld) > datetime.now(get_localzone()).date()
     except ValueError:
         return False
-
-
-def _next_weekday_date(target_weekday: int) -> str:
-    """今日から見て次の target_weekday (mon=0..sun=6)。今日が target_weekday なら今日。"""
-    today = datetime.now(get_localzone()).date()
-    delta = (target_weekday - today.weekday()) % 7
-    return (today + timedelta(days=delta)).isoformat()
 
 
 # --- 持ち出し場所入力 Modal ---
@@ -474,6 +465,50 @@ def _top_out_locations(state: dict, limit: int = _OUT_LOCATION_CHOICES) -> list[
     stats: dict = state.get("out_location_stats") or {}
     ranked = sorted(stats.items(), key=lambda kv: kv[1], reverse=True)
     return [loc for loc, _count in ranked[:limit]]
+
+
+# --- 長期貸出（何日後まで借りるか）の選択メニュー ---
+# 「長期貸出」ボタンを押すと、曜日を問わず「明日/明後日/3日後まで」から選べる。
+
+_LONG_RENT_OFFSETS: tuple[tuple[int, str], ...] = (
+    (1, "明日"),
+    (2, "明後日"),
+    (3, "3日後"),
+)
+
+
+class LongRentSelect(discord.ui.Select):
+    def __init__(self):
+        today = datetime.now(get_localzone()).date()
+        options = [
+            discord.SelectOption(
+                label=f"{term}（{_format_month_day_weekday(today + timedelta(days=offset))}）まで",
+                value=(today + timedelta(days=offset)).isoformat(),
+            )
+            for offset, term in _LONG_RENT_OFFSETS
+        ]
+        super().__init__(
+            placeholder="いつまで借りるか選択してください",
+            options=options,
+            min_values=1,
+            max_values=1,
+        )
+
+    async def callback(self, inter: discord.Interaction) -> None:
+        target_date = date.fromisoformat(self.values[0])
+        await _handle_long_rent_selected(inter, target_date)
+        try:
+            await inter.edit_original_response(
+                content=f"{_format_month_day_weekday(target_date)}まで借りました。", view=None,
+            )
+        except discord.HTTPException:
+            pass
+
+
+class LongRentView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=180)
+        self.add_item(LongRentSelect())
 
 
 # --- NFC HTTP サーバー ---
@@ -599,8 +634,6 @@ def _decorate_embed_with_status(embed: discord.Embed, state: dict) -> None:
 # 持ち主の扱い:
 #   "set_self"            = 押した人を持ち主にする
 #   "clear"               = 持ち主をクリア（返却時など）
-#   "set_self_long_sat"   = 持ち主にしつつ「土曜まで貸出」をセット
-#   "set_self_long_sun"   = 持ち主にしつつ「日曜まで貸出」をセット
 ACTIONS: dict[str, tuple[str, str | None, str, str]] = {
     "key_rent":           ("借りました",           None,     "set_self", "rent_done"),
     "room_open":          ("開けました",           "open",   "set_self", "open_done"),
@@ -609,8 +642,6 @@ ACTIONS: dict[str, tuple[str, str | None, str, str]] = {
     "key_pass_rent":      ("受け取りました",       None,     "set_self", "rent_done"),
     "key_pass_open":      ("受け取りました",       None,     "set_self", "open_done"),
     "key_pass_close":     ("受け取りました",       None,     "set_self", "close_done"),
-    "key_rent_until_sat": ("土曜まで借りました",   None,     "set_self_long_sat", "rent_done"),
-    "key_rent_until_sun": ("日曜まで借りました",   None,     "set_self_long_sun", "rent_done"),
 }
 
 # action → 日本語ラベル（Undo メッセージで使用）
@@ -622,8 +653,7 @@ ACTION_JP: dict[str, str] = {
     "key_pass_rent":      "鍵を受け取る",
     "key_pass_open":      "鍵を受け取る",
     "key_pass_close":     "鍵を受け取る",
-    "key_rent_until_sat": "土曜まで借りる",
-    "key_rent_until_sun": "日曜まで借りる",
+    "key_rent_long":      "長期貸出で借りる",
     "room_out":           "鍵を持ち出す",
     "nfc_toggle":         "NFC 操作",
 }
@@ -639,19 +669,14 @@ def _build_view(view_key: str, *, include_undo: bool = True) -> discord.ui.View:
     view = discord.ui.View()
 
     if view_key == "initial":
-        # 初期画面・返した後: 「借りる」だけ。金曜は土日貸出ボタンも追加
+        # 初期画面・返した後: 「借りる」と「長期貸出」（曜日を問わず表示）
         view.add_item(discord.ui.Button(
             label="借りる", style=discord.ButtonStyle.success, custom_id="key_rent",
         ))
-        if _is_friday():
-            view.add_item(discord.ui.Button(
-                label="土曜まで借りる", style=discord.ButtonStyle.success,
-                custom_id="key_rent_until_sat",
-            ))
-            view.add_item(discord.ui.Button(
-                label="日曜まで借りる", style=discord.ButtonStyle.success,
-                custom_id="key_rent_until_sun",
-            ))
+        view.add_item(discord.ui.Button(
+            label="長期貸出", style=discord.ButtonStyle.success,
+            custom_id="long_rent_open_select",
+        ))
 
     elif view_key == "rent_done":
         # 借りた直後 / 受け取った直後（前=借りた）
@@ -811,18 +836,6 @@ async def _send_action_message(
             state["long_rent_until"] = None
         elif holder_strategy == "set_self":
             _set_holder(state, user)
-        elif holder_strategy == "set_self_long_sat":
-            if not _is_friday():
-                await _send_ephemeral(inter, "土日貸出ボタンは金曜のみ使用できます。")
-                return
-            _set_holder(state, user)
-            state["long_rent_until"] = _next_weekday_date(5)  # 土曜
-        elif holder_strategy == "set_self_long_sun":
-            if not _is_friday():
-                await _send_ephemeral(inter, "土日貸出ボタンは金曜のみ使用できます。")
-                return
-            _set_holder(state, user)
-            state["long_rent_until"] = _next_weekday_date(6)  # 日曜
 
         state["last_change_at"] = _now_iso()
 
@@ -842,8 +855,6 @@ async def _send_action_message(
 
         state["last_message_id"] = new_msg_id
         state["last_message_channel_id"] = channel.id
-        if view_key == "initial":
-            state["friday_buttons_shown"] = _is_friday()
         _push_history(state, action, user, new_msg_id, channel.id, prev)
         _save_state_sync(state)
 
@@ -896,6 +907,48 @@ async def _handle_room_out_submitted(inter: discord.Interaction, location: str) 
 
     asyncio.create_task(_schedule_undo_removal(channel, new_msg_id, "out_done"))
     logger.info("room_out user=%s location=%s", user, location)
+
+
+async def _handle_long_rent_selected(inter: discord.Interaction, target_date: date) -> None:
+    """長期貸出の選択メニューで「いつまで」が選ばれたあとの処理"""
+    channel = inter.channel
+    user = inter.user
+    label = f"{_format_month_day_weekday(target_date)}まで借りました"
+
+    try:
+        await inter.response.defer()
+    except discord.HTTPException:
+        pass
+
+    async with _STATE_LOCK:
+        state = _load_state()
+        prev = _snapshot(state)
+
+        _set_holder(state, user)
+        state["long_rent_until"] = target_date.isoformat()
+        state["last_change_at"] = _now_iso()
+
+        embed = create_Embed(label)
+        _embed_set_actor(embed, user)
+        _decorate_embed_with_status(embed, state)
+        view = _build_view("rent_done", include_undo=True)
+
+        try:
+            sent = await channel.send(embed=embed, view=view)
+            new_msg_id = sent.id
+        except discord.HTTPException as e:
+            logger.warning("long_rent: send failed: %s", e)
+            return
+
+        await _strip_view(channel, prev.get("last_message_id"))
+
+        state["last_message_id"] = new_msg_id
+        state["last_message_channel_id"] = channel.id
+        _push_history(state, "key_rent_long", user, new_msg_id, channel.id, prev)
+        _save_state_sync(state)
+
+    asyncio.create_task(_schedule_undo_removal(channel, new_msg_id, "rent_done"))
+    logger.info("long_rent user=%s until=%s", user, target_date.isoformat())
 
 
 async def _send_ephemeral(inter: discord.Interaction, content: str) -> None:
@@ -996,51 +1049,9 @@ async def _handle_undo(inter: discord.Interaction) -> None:
             except discord.HTTPException as e:
                 logger.warning("undo: initial send failed: %s", e)
 
-        if view_key == "initial":
-            state["friday_buttons_shown"] = _is_friday()
         _save_state_sync(state)
 
     logger.info("undo user=%s action=%s", user, last.get("action"))
-
-
-# --- 金曜の土日貸出ボタンの貼り替え ---
-
-async def _refresh_friday_buttons() -> None:
-    """金曜の境界で、返却済み（初期画面）の最新メッセージのボタンを貼り替える。
-
-    木曜に返却して翌金曜になった場合など、誰も操作しなくても土日貸出ボタンが
-    出るように、表示中の状態と曜日がズレていたら最新メッセージを編集する。
-    （土日に入って金曜でなくなったら逆にボタンを外す）
-    """
-    state = _load_state()
-    # 持ち主なし = 初期画面。土日貸出ボタンの有無が変わるのはこの局面だけ。
-    if state.get("holder_id") is not None:
-        return
-
-    friday_now = _is_friday()
-    if bool(state.get("friday_buttons_shown")) == friday_now:
-        return  # 表示と曜日が一致しているので何もしない
-
-    msg_id = state.get("last_message_id")
-    channel_id = state.get("last_message_channel_id") or _KEY_CHANNEL_ID
-    channel = client.get_channel(channel_id)
-    if channel is None or not msg_id:
-        return
-
-    try:
-        msg = await channel.fetch_message(msg_id)
-        await msg.edit(view=_build_view("initial", include_undo=False))
-    except discord.NotFound:
-        return
-    except discord.HTTPException as e:
-        logger.warning("refresh friday buttons: edit failed: %s", e)
-        return
-
-    async with _STATE_LOCK:
-        s = _load_state()
-        s["friday_buttons_shown"] = friday_now
-        _save_state_sync(s)
-    logger.info("friday buttons refreshed: friday=%s", friday_now)
 
 
 # --- リマインド（自動通知） ---
@@ -1060,9 +1071,6 @@ async def _reminder_tick():
                 s2 = _load_state()
                 s2["long_rent_until"] = None
                 _save_state_sync(s2)
-
-        # 金曜の境界で初期画面（返却済み）の土日貸出ボタンを貼り替える
-        await _refresh_friday_buttons()
 
         if not holder_id:
             return
@@ -1210,14 +1218,6 @@ async def on_ready():
                 _save_state_sync(s)
         except discord.HTTPException as e:
             logger.warning("on_ready: send failed: %s", e)
-
-    # 初期画面を出した場合、土日ボタンの表示状態を記録（金曜境界での貼り替え判定用）
-    if view_key == "initial":
-        async with _STATE_LOCK:
-            s = _load_state()
-            s["friday_buttons_shown"] = _is_friday()
-            _save_state_sync(s)
-
 
 
 # --- スラッシュコマンドの定義 ---
@@ -1428,32 +1428,7 @@ async def reminder_status(inter: discord.Interaction):
     if parts:
         embed.add_field(name="最後に送信した通知", value="\n".join(parts), inline=False)
 
-    # debug_friday は管理者にだけ表示
-    if state.get("debug_friday") and _is_admin(inter.user.id):
-        embed.add_field(name="🛠 debug_friday", value="ON（金曜扱い）", inline=False)
-
     await inter.response.send_message(embed=embed, ephemeral=True)
-
-
-@tree.command(
-    name="debug_friday",
-    description="(管理者) 金曜モードのON/OFFを切り替え（土日貸出ボタン表示テスト）",
-)
-@app_commands.describe(on="True=金曜扱い、False=通常曜日に戻す")
-async def debug_friday(inter: discord.Interaction, on: bool):
-    """/debug_friday: 金曜モードのフラグを切り替える（テスト用、管理者のみ）"""
-    if not _is_admin(inter.user.id):
-        await inter.response.send_message("管理者のみ実行できます。", ephemeral=True)
-        return
-    async with _STATE_LOCK:
-        s = _load_state()
-        s["debug_friday"] = bool(on)
-        _save_state_sync(s)
-    await inter.response.send_message(
-        f"[debug] 金曜モードを {'ON' if on else 'OFF'} にしました。",
-        ephemeral=True,
-    )
-    logger.info("debug_friday user=%s on=%s", inter.user, on)
 
 
 @tree.command(
@@ -1530,9 +1505,20 @@ async def on_button_click(inter: discord.Interaction):
     if not custom_id:
         return
 
-    # 「取り消す」と「持ち出す」は特殊処理
+    # 「取り消す」「持ち出す」「長期貸出」は特殊処理
     if custom_id == "undo":
         await _handle_undo(inter)
+        return
+
+    if custom_id == "long_rent_open_select":
+        try:
+            await inter.response.send_message(
+                "いつまで借りるか選択してください。",
+                view=LongRentView(),
+                ephemeral=True,
+            )
+        except discord.HTTPException as e:
+            logger.warning("send long rent select failed: %s", e)
         return
 
     if custom_id == "room_out_open_modal":

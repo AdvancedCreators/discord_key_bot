@@ -161,8 +161,7 @@ NFC HTTP server listening on port 8080
 | ボタン | 動作 | 次に表示されるボタン |
 |-------|------|------------------|
 | 借りる | 自分を持ち主に設定 | 開ける / 返す / 受け取る / 持ち出す |
-| 土曜まで借りる | 持ち主設定 + 長期貸出（土）※金曜のみ表示 | 同上 |
-| 日曜まで借りる | 持ち主設定 + 長期貸出（日）※金曜のみ表示 | 同上 |
+| 長期貸出 | 選択メニュー（明日/明後日/3 日後）→ 持ち主設定 + 長期貸出セット ※曜日を問わず常に表示 | 同上 |
 | 開ける | state を `open` に | 閉める / 受け取る |
 | 閉める | state を `closed` に | 開ける / 返す / 受け取る / 持ち出す |
 | 返す | 持ち主をクリア、state を `closed` に | 借りる（初期画面） |
@@ -178,7 +177,6 @@ NFC HTTP server listening on port 8080
 | `/nfc_register` | 全員 | NFC タグ用の秘密トークンを発行 |
 | `/reminder_daily hour:<時刻>` | 持ち主のみ | 返却催促リマインドの時刻を変更（0 で停止） |
 | `/reminder_idle hours:<時間>` | 持ち主のみ | 場所未報告リマインドの時間を変更（0 で停止） |
-| `/debug_friday on:<bool>` | 管理者のみ | 金曜モードの ON/OFF 切り替え（テスト用） |
 | `/debug_reminder type:<daily/idle>` | 管理者のみ | リマインドを即時送信（テスト用） |
 
 ### 6-3. リマインド仕様
@@ -210,7 +208,6 @@ NFC HTTP server listening on port 8080
   "last_message_id": null,  // 最新のボットメッセージID
   "out_location": null,     // 持ち出し中の場所
   "long_rent_until": null,  // 長期貸出の最終日 YYYY-MM-DD
-  "debug_friday": false,
   "reminder": { ... },
   "history": []             // 末尾 20 件のみ保持
 }
