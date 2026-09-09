@@ -2,7 +2,7 @@
 
 > **対象読者**: このシステムを引き継ぐ運用担当者  
 > **作成日**: 2026-06-20  
-> **最終更新**: 2026-06-20
+> **最終更新**: 2026-09-09
 
 ---
 
@@ -32,23 +32,27 @@
 
 | 項目 | 内容 |
 |------|------|
-| ホスト名 / IP | ※ 実際のホスト名または IP を記入 |
-| OS | ※ 例: Ubuntu 24.04 LTS |
-| 実行ユーザー | ※ 例: `botuser` |
-| 稼働方式 | systemd サービス（またはその他 — 該当を記入） |
-| 自動起動 | ※ はい / いいえ |
+| ホスト名 / IP | 秘匿情報のため本書には記載しない。GitHub Secrets の `DEPLOY_HOST` と同じ値（運用担当者間で別途共有） |
+| OS | ※ 未確認・記入 |
+| 実行ユーザー（Bot本体） | `advan` |
+| 実行ユーザー（自動デプロイ専用） | `deploy-bot`（ログインシェルは通常シェル、パスワードはロック。sudoは `systemctl restart key_bot` のみNOPASSWDで許可。`advan` と共有グループ `keybot` で `/opt/key_bot` を読み書き） |
+| 稼働方式 | systemd サービス（ユニット名: `key_bot.service`） |
+| 自動起動 | ※ 未確認・記入（`systemctl is-enabled key_bot` で確認可） |
 
 ### 2-3. ディレクトリ構成
 
 ```
-/path/to/discord_key_bot/          ← ※実際のパスを記入
+/opt/key_bot/
 ├── key_bot.py                     # ボット本体
 ├── requirements.txt               # Python 依存パッケージ
 ├── README.md                      # セットアップ手順（開発者向け）
 ├── USAGE.md                       # 使い方ガイド（利用者向け）
 ├── HANDOVER.md                    # この引き継ぎ書
+├── .github/workflows/
+│   ├── ci.yml                     # 構文/致命的Lintチェック（push・PR時）
+│   └── deploy.yml                 # main マージ時の自動デプロイ
 ├── .env                           # 機密設定（バックアップ必須・Git 除外）
-├── .venv/                         # Python 仮想環境
+├── venv/                          # Python 仮想環境
 ├── logs/
 │   └── key_bot.log.*              # ローテーションログ（自動生成）
 ├── room_state.json                # 鍵の状態・履歴（自動生成・Git 除外）
@@ -96,32 +100,35 @@ LOG_BACKUP_COUNT=5                      # ログのローテーション世代�
 
 ## 4. 起動・停止・再起動
 
-### systemd で管理している場合
+### systemd で管理している（本番はこちら）
 
 ```bash
 # 状態確認
-sudo systemctl status discord-key-bot
+sudo systemctl status key_bot
 
 # 再起動（設定変更後や落ちたとき）
-sudo systemctl restart discord-key-bot
+sudo systemctl restart key_bot
 
 # 停止
-sudo systemctl stop discord-key-bot
+sudo systemctl stop key_bot
 
 # ログをリアルタイムで見る
-sudo journalctl -u discord-key-bot -f
+sudo journalctl -u key_bot -f
 ```
 
-### 手動で起動している場合
+> `main` へのマージで自動的に `git pull` + 上記の再起動が実行されます（11章参照）。
+> 手動での再起動は、緊急時や自動デプロイが失敗したときのみ。
+
+### 手動で起動する場合
 
 ```bash
-cd /path/to/discord_key_bot        # ※実際のパスに変更
-.venv/bin/python key_bot.py
+cd /opt/key_bot
+venv/bin/python key_bot.py
 ```
 
 バックグラウンド実行:
 ```bash
-nohup .venv/bin/python key_bot.py > /dev/null 2>&1 &
+nohup venv/bin/python key_bot.py > /dev/null 2>&1 &
 ```
 
 ### 起動確認ポイント
@@ -139,7 +146,7 @@ NFC HTTP server listening on port 8080
 
 | 項目 | バージョン |
 |------|----------|
-| Python | 3.13 以上（`str \| None` 構文を使用） |
+| Python | 3.10 以上（`str \| None` 構文を使用）。本番は 3.12 で稼働中 |
 | discord.py | 2.7.1 |
 | aiohttp | 3.13.5 |
 | python-dotenv | 1.2.2 |
@@ -148,8 +155,8 @@ NFC HTTP server listening on port 8080
 依存パッケージを更新するとき:
 
 ```bash
-.venv/bin/pip install -r requirements.txt   # インストール
-.venv/bin/pip freeze > requirements.txt     # バージョンを固定
+venv/bin/pip install -r requirements.txt   # インストール
+venv/bin/pip freeze > requirements.txt     # バージョンを固定
 ```
 
 ---
@@ -271,15 +278,41 @@ tail -50 logs/key_bot.log
 
 | 項目 | 内容 |
 |------|------|
-| リポジトリ | ※ GitHub リポジトリの URL を記入 |
-| ブランチ運用 | `main` ブランチが本番 |
-| Git 除外ファイル | `.env`, `logs/`, `room_state.json`, `nfc_tokens.json`, `.venv/` |
+| リポジトリ | https://github.com/AdvancedCreators/discord_key_bot |
+| ブランチ運用 | `main` ブランチが本番。機能ごとにブランチを切り、PRを`main`にマージする |
+| Git 除外ファイル | `.env`, `logs/`, `room_state.json`, `nfc_tokens.json`, `venv/` |
 
-デプロイ手順（コードを更新するとき）:
+### 11-1. 自動デプロイ（CI/CD）
+
+PRを `main` にマージすると、以下が自動実行されます（`.github/workflows/deploy.yml`）:
+
+1. `main` へ push（マージ）
+2. `.github/workflows/ci.yml` が構文チェック・致命的Lintチェックを実行
+3. 成功したら GitHub Actions が本番サーバーへ SSH 接続し、以下を実行:
+   ```bash
+   cd /opt/key_bot
+   git fetch origin main
+   git merge --ff-only origin/main
+   venv/bin/pip install -r requirements.txt
+   sudo systemctl restart key_bot
+   ```
+
+実行状況は GitHub の Actions タブ（`Deploy` ワークフロー）で確認できる。
+
+**関連する設定:**
+
+| 項目 | 内容 |
+|------|------|
+| デプロイ用アカウント | `deploy-bot`（ログインシェルは通常シェル、パスワードはロック。SSH鍵認証のみ） |
+| sudo権限 | `deploy-bot` に `systemctl restart key_bot` のみ NOPASSWD 許可（`/etc/sudoers.d/`） |
+| GitHub Secrets | `DEPLOY_HOST` / `DEPLOY_USER` / `DEPLOY_SSH_KEY` / `DEPLOY_PATH`（Settings → Secrets and variables → Actions） |
+
+**手動デプロイ**（緊急時・自動デプロイ失敗時）:
 
 ```bash
+cd /opt/key_bot
 git pull origin main
-sudo systemctl restart discord-key-bot
+sudo systemctl restart key_bot
 ```
 
 ---
@@ -299,3 +332,6 @@ sudo systemctl restart discord-key-bot
 | 日付 | 変更内容 | 担当者 |
 |------|---------|--------|
 | 2026-06-20 | 初版作成 | ※ 記入 |
+| 2026-09-05 | 長期貸出を金曜限定から曜日を問わず選べる方式に統一 | ※ 記入 |
+| 2026-09-05 | `main`マージでの自動デプロイ(CI/CD)を追加、`AdvancedCreators` 組織へリポジトリ移管 | ※ 記入 |
+| 2026-09-09 | 本章を実際の本番構成（パス・サービス名・デプロイ手順）に合わせて更新 | ※ 記入 |
