@@ -118,18 +118,7 @@ sudo journalctl -u key_bot -f
 
 > `main` へのマージで自動的に `git pull` + 上記の再起動が実行されます（11章参照）。
 > 手動での再起動は、緊急時や自動デプロイが失敗したときのみ。
-
-### 手動で起動する場合
-
-```bash
-cd /opt/key_bot
-venv/bin/python key_bot.py
-```
-
-バックグラウンド実行:
-```bash
-nohup venv/bin/python key_bot.py > /dev/null 2>&1 &
-```
+> ゼロから手動起動する手順は [README.md](./README.md) の「セットアップ手順」を参照。
 
 ### 起動確認ポイント
 
@@ -176,57 +165,21 @@ venv/bin/pip freeze > requirements.txt     # バージョンを固定
 | 持ち出す | 場所入力 Modal → state を `out` に | 開ける / 返す / 受け取る |
 | 取り消す | 直前の操作を 1 分以内・本人限定で巻き戻す | — |
 
-### 6-2. スラッシュコマンド
+### 6-2. スラッシュコマンド / リマインド仕様 / NFC連携
 
-| コマンド | 権限 | 説明 |
-|---------|------|------|
-| `/reminder_status` | 全員 | 現在の鍵の状態・リマインド設定を自分にだけ表示 |
-| `/nfc_register` | 全員 | NFC タグ用の秘密トークンを発行 |
-| `/reminder_daily hour:<時刻>` | 持ち主のみ | 返却催促リマインドの時刻を変更（0 で停止） |
-| `/reminder_idle hours:<時間>` | 持ち主のみ | 場所未報告リマインドの時間を変更（0 で停止） |
-| `/debug_reminder type:<daily/idle>` | 管理者のみ | リマインドを即時送信（テスト用） |
-
-### 6-3. リマインド仕様
-
-| 種類 | トリガー | 送信条件 | 抑制条件 |
-|------|---------|---------|---------|
-| 返却催促 (daily) | 毎日 設定時刻以降 | 未返却（`closed` / `out`）かつ最終操作から 30 分以上 + 当日未送信 | 長期貸出の最終日より前 |
-| 場所未報告 (idle) | 毎分チェック | `closed` 状態（持ち主あり）で指定時間以上経過 | 長期貸出期間中 |
-
-### 6-4. NFC 連携
-
-- エンドポイント: `POST http://<サーバーIP>:8080/nfc`
-- リクエストボディ: `{ "token": "</nfc_register で取得したトークン>" }`
-- 動作: 鍵の状態を open ↔ closed でトグルし、Discord チャンネルに通知
+[README.md](./README.md) の「スラッシュコマンド一覧」「リマインド仕様」「NFC連携」を参照。
+内容はREADME.mdに一本化しており、本書には重複記載しない。
 
 ---
 
 ## 7. データ永続化
 
-### `room_state.json` — 鍵の現在状態
-
-```jsonc
-{
-  "schema_version": 2,
-  "state": "closed",        // "open" | "closed" | "out"
-  "holder_id": null,        // 現在の持ち主の Discord ユーザーID
-  "holder_name": null,
-  "last_change_at": null,   // 最終操作の ISO8601 日時
-  "last_message_id": null,  // 最新のボットメッセージID
-  "out_location": null,     // 持ち出し中の場所
-  "long_rent_until": null,  // 長期貸出の最終日 YYYY-MM-DD
-  "reminder": { ... },
-  "history": []             // 末尾 20 件のみ保持
-}
-```
+`room_state.json` のスキーマ・アトミック書き込み・排他制御などの詳細は
+[README.md](./README.md) の「データ永続化」を参照。以下は運用上の注意点のみ:
 
 - ボットを**再起動しても状態は保持**されます（ファイルが存在する限り）
 - 壊れた場合は削除すると初期状態（施錠・持ち主なし）でリセット
-
-### `nfc_tokens.json` — NFC 認証トークン
-
-- 各ユーザーが `/nfc_register` を実行するたびに上書きされる
-- ユーザー ID → トークンの対応表
+- `nfc_tokens.json` は各ユーザーが `/nfc_register` を実行するたびに上書きされる（ユーザーID→トークンの対応表）
 
 ---
 
@@ -284,28 +237,15 @@ tail -50 logs/key_bot.log
 
 ### 11-1. 自動デプロイ（CI/CD）
 
-PRを `main` にマージすると、以下が自動実行されます（`.github/workflows/deploy.yml`）:
-
-1. `main` へ push（マージ）
-2. `.github/workflows/ci.yml` が構文チェック・致命的Lintチェックを実行
-3. 成功したら GitHub Actions が本番サーバーへ SSH 接続し、以下を実行:
-   ```bash
-   cd /opt/key_bot
-   git fetch origin main
-   git merge --ff-only origin/main
-   venv/bin/pip install -r requirements.txt
-   sudo systemctl restart key_bot
-   ```
-
-実行状況は GitHub の Actions タブ（`Deploy` ワークフロー）で確認できる。
-
-**関連する設定:**
+仕組みの詳細は [README.md](./README.md) の「`main` マージでの自動デプロイ」を参照。
+以下はこのインスタンス固有の値（README.mdには書かない本番限定情報）:
 
 | 項目 | 内容 |
 |------|------|
 | デプロイ用アカウント | `deploy-bot`（ログインシェルは通常シェル、パスワードはロック。SSH鍵認証のみ） |
 | sudo権限 | `deploy-bot` に `systemctl restart key_bot` のみ NOPASSWD 許可（`/etc/sudoers.d/`） |
-| GitHub Secrets | `DEPLOY_HOST` / `DEPLOY_USER` / `DEPLOY_SSH_KEY` / `DEPLOY_PATH`（Settings → Secrets and variables → Actions） |
+| GitHub Secrets登録先 | `AdvancedCreators/discord_key_bot` の Settings → Secrets and variables → Actions |
+| 実行状況の確認 | GitHub の Actions タブ（`Deploy` ワークフロー） |
 
 **手動デプロイ**（緊急時・自動デプロイ失敗時）:
 
