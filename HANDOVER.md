@@ -2,7 +2,7 @@
 
 > **対象読者**: このシステムを引き継ぐ運用担当者  
 > **作成日**: 2026-06-20  
-> **最終更新**: 2026-06-20
+> **最終更新**: 2026-09-09
 
 ---
 
@@ -32,23 +32,27 @@
 
 | 項目 | 内容 |
 |------|------|
-| ホスト名 / IP | ※ 実際のホスト名または IP を記入 |
-| OS | ※ 例: Ubuntu 24.04 LTS |
-| 実行ユーザー | ※ 例: `botuser` |
-| 稼働方式 | systemd サービス（またはその他 — 該当を記入） |
-| 自動起動 | ※ はい / いいえ |
+| ホスト名 / IP | 秘匿情報のため本書には記載しない。GitHub Secrets の `DEPLOY_HOST` と同じ値（運用担当者間で別途共有） |
+| OS | ※ 未確認・記入 |
+| 実行ユーザー（Bot本体） | `advan` |
+| 実行ユーザー（自動デプロイ専用） | `deploy-bot`（ログインシェルは通常シェル、パスワードはロック。sudoは `systemctl restart key_bot` のみNOPASSWDで許可。`advan` と共有グループ `keybot` で `/opt/key_bot` を読み書き） |
+| 稼働方式 | systemd サービス（ユニット名: `key_bot.service`） |
+| 自動起動 | ※ 未確認・記入（`systemctl is-enabled key_bot` で確認可） |
 
 ### 2-3. ディレクトリ構成
 
 ```
-/path/to/discord_key_bot/          ← ※実際のパスを記入
+/opt/key_bot/
 ├── key_bot.py                     # ボット本体
 ├── requirements.txt               # Python 依存パッケージ
 ├── README.md                      # セットアップ手順（開発者向け）
 ├── USAGE.md                       # 使い方ガイド（利用者向け）
 ├── HANDOVER.md                    # この引き継ぎ書
+├── .github/workflows/
+│   ├── ci.yml                     # 構文/致命的Lintチェック（push・PR時）
+│   └── deploy.yml                 # main マージ時の自動デプロイ
 ├── .env                           # 機密設定（バックアップ必須・Git 除外）
-├── .venv/                         # Python 仮想環境
+├── venv/                          # Python 仮想環境
 ├── logs/
 │   └── key_bot.log.*              # ローテーションログ（自動生成）
 ├── room_state.json                # 鍵の状態・履歴（自動生成・Git 除外）
@@ -96,33 +100,25 @@ LOG_BACKUP_COUNT=5                      # ログのローテーション世代�
 
 ## 4. 起動・停止・再起動
 
-### systemd で管理している場合
+### systemd で管理している（本番はこちら）
 
 ```bash
 # 状態確認
-sudo systemctl status discord-key-bot
+sudo systemctl status key_bot
 
 # 再起動（設定変更後や落ちたとき）
-sudo systemctl restart discord-key-bot
+sudo systemctl restart key_bot
 
 # 停止
-sudo systemctl stop discord-key-bot
+sudo systemctl stop key_bot
 
 # ログをリアルタイムで見る
-sudo journalctl -u discord-key-bot -f
+sudo journalctl -u key_bot -f
 ```
 
-### 手動で起動している場合
-
-```bash
-cd /path/to/discord_key_bot        # ※実際のパスに変更
-.venv/bin/python key_bot.py
-```
-
-バックグラウンド実行:
-```bash
-nohup .venv/bin/python key_bot.py > /dev/null 2>&1 &
-```
+> `main` へのマージで自動的に `git pull` + 上記の再起動が実行されます（11章参照）。
+> 手動での再起動は、緊急時や自動デプロイが失敗したときのみ。
+> ゼロから手動起動する手順は [README.md](./README.md) の「セットアップ手順」を参照。
 
 ### 起動確認ポイント
 
@@ -139,7 +135,7 @@ NFC HTTP server listening on port 8080
 
 | 項目 | バージョン |
 |------|----------|
-| Python | 3.13 以上（`str \| None` 構文を使用） |
+| Python | 3.10 以上（`str \| None` 構文を使用）。本番は 3.12 で稼働中 |
 | discord.py | 2.7.1 |
 | aiohttp | 3.13.5 |
 | python-dotenv | 1.2.2 |
@@ -148,8 +144,8 @@ NFC HTTP server listening on port 8080
 依存パッケージを更新するとき:
 
 ```bash
-.venv/bin/pip install -r requirements.txt   # インストール
-.venv/bin/pip freeze > requirements.txt     # バージョンを固定
+venv/bin/pip install -r requirements.txt   # インストール
+venv/bin/pip freeze > requirements.txt     # バージョンを固定
 ```
 
 ---
@@ -169,57 +165,21 @@ NFC HTTP server listening on port 8080
 | 持ち出す | 場所入力 Modal → state を `out` に | 開ける / 返す / 受け取る |
 | 取り消す | 直前の操作を 1 分以内・本人限定で巻き戻す | — |
 
-### 6-2. スラッシュコマンド
+### 6-2. スラッシュコマンド / リマインド仕様 / NFC連携
 
-| コマンド | 権限 | 説明 |
-|---------|------|------|
-| `/reminder_status` | 全員 | 現在の鍵の状態・リマインド設定を自分にだけ表示 |
-| `/nfc_register` | 全員 | NFC タグ用の秘密トークンを発行 |
-| `/reminder_daily hour:<時刻>` | 持ち主のみ | 返却催促リマインドの時刻を変更（0 で停止） |
-| `/reminder_idle hours:<時間>` | 持ち主のみ | 場所未報告リマインドの時間を変更（0 で停止） |
-| `/debug_reminder type:<daily/idle>` | 管理者のみ | リマインドを即時送信（テスト用） |
-
-### 6-3. リマインド仕様
-
-| 種類 | トリガー | 送信条件 | 抑制条件 |
-|------|---------|---------|---------|
-| 返却催促 (daily) | 毎日 設定時刻以降 | 未返却（`closed` / `out`）かつ最終操作から 30 分以上 + 当日未送信 | 長期貸出の最終日より前 |
-| 場所未報告 (idle) | 毎分チェック | `closed` 状態（持ち主あり）で指定時間以上経過 | 長期貸出期間中 |
-
-### 6-4. NFC 連携
-
-- エンドポイント: `POST http://<サーバーIP>:8080/nfc`
-- リクエストボディ: `{ "token": "</nfc_register で取得したトークン>" }`
-- 動作: 鍵の状態を open ↔ closed でトグルし、Discord チャンネルに通知
+[README.md](./README.md) の「スラッシュコマンド一覧」「リマインド仕様」「NFC連携」を参照。
+内容はREADME.mdに一本化しており、本書には重複記載しない。
 
 ---
 
 ## 7. データ永続化
 
-### `room_state.json` — 鍵の現在状態
-
-```jsonc
-{
-  "schema_version": 2,
-  "state": "closed",        // "open" | "closed" | "out"
-  "holder_id": null,        // 現在の持ち主の Discord ユーザーID
-  "holder_name": null,
-  "last_change_at": null,   // 最終操作の ISO8601 日時
-  "last_message_id": null,  // 最新のボットメッセージID
-  "out_location": null,     // 持ち出し中の場所
-  "long_rent_until": null,  // 長期貸出の最終日 YYYY-MM-DD
-  "reminder": { ... },
-  "history": []             // 末尾 20 件のみ保持
-}
-```
+`room_state.json` のスキーマ・アトミック書き込み・排他制御などの詳細は
+[README.md](./README.md) の「データ永続化」を参照。以下は運用上の注意点のみ:
 
 - ボットを**再起動しても状態は保持**されます（ファイルが存在する限り）
 - 壊れた場合は削除すると初期状態（施錠・持ち主なし）でリセット
-
-### `nfc_tokens.json` — NFC 認証トークン
-
-- 各ユーザーが `/nfc_register` を実行するたびに上書きされる
-- ユーザー ID → トークンの対応表
+- `nfc_tokens.json` は各ユーザーが `/nfc_register` を実行するたびに上書きされる（ユーザーID→トークンの対応表）
 
 ---
 
@@ -271,15 +231,28 @@ tail -50 logs/key_bot.log
 
 | 項目 | 内容 |
 |------|------|
-| リポジトリ | ※ GitHub リポジトリの URL を記入 |
-| ブランチ運用 | `main` ブランチが本番 |
-| Git 除外ファイル | `.env`, `logs/`, `room_state.json`, `nfc_tokens.json`, `.venv/` |
+| リポジトリ | https://github.com/AdvancedCreators/discord_key_bot |
+| ブランチ運用 | `main` ブランチが本番。機能ごとにブランチを切り、PRを`main`にマージする |
+| Git 除外ファイル | `.env`, `logs/`, `room_state.json`, `nfc_tokens.json`, `venv/` |
 
-デプロイ手順（コードを更新するとき）:
+### 11-1. 自動デプロイ（CI/CD）
+
+仕組みの詳細は [README.md](./README.md) の「`main` マージでの自動デプロイ」を参照。
+以下はこのインスタンス固有の値（README.mdには書かない本番限定情報）:
+
+| 項目 | 内容 |
+|------|------|
+| デプロイ用アカウント | `deploy-bot`（ログインシェルは通常シェル、パスワードはロック。SSH鍵認証のみ） |
+| sudo権限 | `deploy-bot` に `systemctl restart key_bot` のみ NOPASSWD 許可（`/etc/sudoers.d/`） |
+| GitHub Secrets登録先 | `AdvancedCreators/discord_key_bot` の Settings → Secrets and variables → Actions |
+| 実行状況の確認 | GitHub の Actions タブ（`Deploy` ワークフロー） |
+
+**手動デプロイ**（緊急時・自動デプロイ失敗時）:
 
 ```bash
+cd /opt/key_bot
 git pull origin main
-sudo systemctl restart discord-key-bot
+sudo systemctl restart key_bot
 ```
 
 ---
@@ -299,3 +272,6 @@ sudo systemctl restart discord-key-bot
 | 日付 | 変更内容 | 担当者 |
 |------|---------|--------|
 | 2026-06-20 | 初版作成 | ※ 記入 |
+| 2026-09-05 | 長期貸出を金曜限定から曜日を問わず選べる方式に統一 | ※ 記入 |
+| 2026-09-05 | `main`マージでの自動デプロイ(CI/CD)を追加、`AdvancedCreators` 組織へリポジトリ移管 | ※ 記入 |
+| 2026-09-09 | 本章を実際の本番構成（パス・サービス名・デプロイ手順）に合わせて更新 | ※ 記入 |
