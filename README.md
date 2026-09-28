@@ -23,7 +23,7 @@
 
 ## 動作要件
 
-- **Python 3.13** 以上（型ヒント `str | None` 構文を使用）
+- **Python 3.10** 以上（型ヒント `str | None` 構文を使用。本番は 3.12 で稼働）
 - Discord Bot トークン
 - Bot が参加している Discord サーバー
 
@@ -40,7 +40,7 @@
 ### 1. リポジトリのクローン
 
 ```bash
-git clone https://github.com/<your-account>/discord_key_bot.git
+git clone https://github.com/AdvancedCreators/discord_key_bot.git
 cd discord_key_bot
 ```
 
@@ -130,6 +130,41 @@ sudo systemctl daemon-reload
 sudo systemctl enable --now discord-key-bot
 sudo systemctl status discord-key-bot
 ```
+
+### `main` マージでの自動デプロイ（CI/CD）
+
+`.github/workflows/deploy.yml` により、`main` への push（PRマージ含む）で
+`.github/workflows/ci.yml`（構文/致命的Lintチェック）が成功すると、
+本番サーバーへ SSH 接続して以下を自動実行します:
+
+```bash
+git fetch origin main
+git merge --ff-only origin/main
+<venv>/bin/pip install -r requirements.txt
+sudo systemctl restart <サービス名>
+```
+
+事前準備:
+
+1. デプロイ専用の SSH 鍵ペアを作成し、公開鍵をデプロイ用ユーザーの
+   `~/.ssh/authorized_keys` に登録
+2. デプロイ用ユーザーに、サービス再起動コマンドだけ NOPASSWD で許可
+   （`/etc/sudoers.d/` に `ユーザー名 ALL=(root) NOPASSWD: /usr/bin/systemctl restart <サービス名>` を追加）
+3. デプロイ用ユーザーのログインシェルは通常のシェル（`/bin/bash` 等）にすること。
+   `/usr/sbin/nologin` にすると SSH 経由のコマンド実行自体が拒否される
+4. 本番サーバー上の作業ディレクトリを `git clone`（または `git init` + `git remote add` +
+   `git fetch` + `git checkout -B main origin/main`）で Git 管理下にしておく
+5. リポジトリの Settings → Secrets and variables → Actions に以下を登録:
+
+| Secret | 内容 |
+|---|---|
+| `DEPLOY_HOST` | 本番サーバーのグローバルIP/ホスト名（社内向けなど名前解決できないホスト名は不可） |
+| `DEPLOY_USER` | デプロイ用ユーザー名 |
+| `DEPLOY_SSH_KEY` | デプロイ用ユーザーの秘密鍵の中身 |
+| `DEPLOY_PATH` | 本番サーバー上のリポジトリのパス |
+| `DEPLOY_PORT` | SSHポート（22番なら省略可） |
+
+Deployの実行状況は GitHub の Actions タブから確認できます。
 
 ---
 
